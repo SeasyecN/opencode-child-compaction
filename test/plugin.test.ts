@@ -13,7 +13,7 @@ type ProviderFixture = {
 type ClientDouble = {
   readonly session: {
     readonly get: (input: { readonly path: { readonly id: string } }) => Promise<{ readonly data: Session }>;
-    readonly summarize: (input: { readonly path: { readonly id: string }; readonly body: { readonly providerID: string; readonly modelID: string } }) => Promise<unknown>;
+    readonly summarize: (input: { readonly path: { readonly id: string }; readonly body: { readonly providerID: string; readonly modelID: string; readonly auto?: boolean } }) => Promise<unknown>;
   };
   readonly config: {
     readonly providers: () => Promise<{ readonly data?: ProviderFixture }>;
@@ -124,14 +124,21 @@ test("missing model metadata skips compaction", async () => {
 });
 
 test("eligible child summarizes repeatedly after each settled call", async () => {
-  const calls: Array<{ readonly providerID: string; readonly modelID: string }> = [];
+  const calls: Array<{ readonly providerID: string; readonly modelID: string; readonly auto?: boolean }> = [];
   const hooks = await hooksFor(session(), async (input) => { calls.push(input.body); });
   await hooks.event?.({ event: event(assistant()) });
   await hooks.event?.({ event: event(assistant({ id: "msg-2" })) });
   expect(calls).toEqual([
-    { providerID: "openai", modelID: "gpt-5.6-luna" },
-    { providerID: "openai", modelID: "gpt-5.6-luna" },
+    { providerID: "openai", modelID: "gpt-5.6-luna", auto: true },
+    { providerID: "openai", modelID: "gpt-5.6-luna", auto: true },
   ]);
+});
+
+test("eligible child requests native auto-continuation after summarize", async () => {
+  const requests: Array<Parameters<ClientDouble["session"]["summarize"]>[0]["body"]> = [];
+  const hooks = await hooksFor(session(), async (input) => { requests.push(input.body); });
+  await hooks.event?.({ event: event(assistant()) });
+  expect(requests[0]?.auto).toBe(true);
 });
 
 test("cache-read contributes to threshold", async () => {

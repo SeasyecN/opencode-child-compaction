@@ -1,9 +1,23 @@
 {
-  "name": "opencode-child-compaction",
+  "name": "@seasyecn/opencode-child-compaction",
   "version": "0.1.0",
-  "private": true,
+  "description": "OpenCode plugin that compacts eligible child sessions at an adaptive context threshold.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SeasyecN/opencode-child-compaction"
+  },
   "type": "module",
   "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",

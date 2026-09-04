@@ -69,9 +69,14 @@ var ChildCompactionPlugin = async ({ client }) => {
         const session = sessionResponse.data;
         if (!isEligibleChildSession(session))
           return;
+        const summarizeBody = {
+          providerID: SUMMARIZE_PROVIDER,
+          modelID: SUMMARIZE_MODEL,
+          auto: true
+        };
         await client.session.summarize({
           path: { id: message.sessionID },
-          body: { providerID: SUMMARIZE_PROVIDER, modelID: SUMMARIZE_MODEL }
+          body: summarizeBody
         });
       } finally {
         inFlightSessions.delete(message.sessionID);

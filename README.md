@@ -58,7 +58,12 @@ native `session.summarize` operation with this fixed target:
 ```text
 providerID: openai
 modelID: gpt-5.6-luna
+auto: true
 ```
+
+The per-request `auto: true` flag enables OpenCode's native continuation after
+the summary is created. It applies only to this explicit child-session
+summarize call; it does not enable global automatic compaction.
 
 The `openai/gpt-5.6-luna` model must be configured and available in OpenCode.
 The plugin does not configure the provider, endpoint, credentials, or model.
@@ -74,6 +79,30 @@ are ignored. The in-flight marker is per session and is cleared when the
 operation finishes, so separate sessions can be processed independently.
 
 ## Installation
+
+### Published package
+
+Install the published package from npm:
+
+```sh
+npm install @seasyecn/opencode-child-compaction
+```
+
+Register the package name in the existing `plugin` array in
+`~/.config/opencode/opencode.json`:
+
+```json
+{
+  "plugin": [
+    "@seasyecn/opencode-child-compaction"
+  ]
+}
+```
+
+Merge this entry with any other registered plugins. Restart OpenCode after
+changing the registration.
+
+### Local development
 
 From the project root, install dependencies and build the plugin:
 
@@ -97,7 +126,8 @@ Register the built entry point in the existing `plugin` array in
 Merge this entry with any other registered plugins. Restart OpenCode after
 changing the registration.
 
-For this child-only design, also keep global compaction disabled:
+For this child-only design, keep global compaction disabled. The plugin enables
+native continuation only on its explicit summarize request:
 
 ```json
 {
