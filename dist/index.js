@@ -1,4 +1,32 @@
 // @bun
+// src/config.ts
+import { readFile } from "fs/promises";
+import { fileURLToPath } from "url";
+
+class SummarizationConfigError extends Error {
+  configPath;
+  name = "SummarizationConfigError";
+  constructor(configPath, cause) {
+    super(`Cannot initialize child compaction: create or fix ${configPath}. ` + 'It must be readable JSON containing only "providerID" and "modelID", both nonblank strings. ' + "Restart OpenCode after fixing the file.", { cause });
+    this.configPath = configPath;
+  }
+}
+async function loadSummarizationConfig(configUrl) {
+  const configPath = fileURLToPath(configUrl);
+  let value;
+  try {
+    value = JSON.parse(await readFile(configUrl, "utf8"));
+  } catch (error) {
+    if (error instanceof Error)
+      throw new SummarizationConfigError(configPath, error);
+    throw error;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value) || !("providerID" in value) || typeof value.providerID !== "string" || value.providerID.trim() === "" || !("modelID" in value) || typeof value.modelID !== "string" || value.modelID.trim() === "" || Object.keys(value).length !== 2) {
+    throw new SummarizationConfigError(configPath);
+  }
+  return { providerID: value.providerID, modelID: value.modelID };
+}
+
 // src/decision.ts
 var MAGIC_CONTEXT_TITLE_PREFIX = "magic-context-";
 var COMPACTION_THRESHOLD_RATIO = 0.75;
@@ -22,8 +50,6 @@ function isCompletedNonCompactionAssistantMessage(message) {
 }
 
 // src/index.ts
-var SUMMARIZE_PROVIDER = "openai";
-var SUMMARIZE_MODEL = "gpt-5.6-luna";
 function isAssistantMessage(message) {
   return message.role === "assistant";
 }
@@ -48,6 +74,7 @@ async function resolveModelLimit(client, providerID, modelID) {
   return model ? toModelLimit(model) : undefined;
 }
 var ChildCompactionPlugin = async ({ client }) => {
+  const summarizeConfig = await loadSummarizationConfig(new URL("../config.json", import.meta.url));
   const inFlightSessions = new Set;
   return {
     event: async ({ event }) => {
@@ -70,8 +97,8 @@ var ChildCompactionPlugin = async ({ client }) => {
         if (!isEligibleChildSession(session))
           return;
         const summarizeBody = {
-          providerID: SUMMARIZE_PROVIDER,
-          modelID: SUMMARIZE_MODEL,
+          providerID: summarizeConfig.providerID,
+          modelID: summarizeConfig.modelID,
           auto: true
         };
         await client.session.summarize({

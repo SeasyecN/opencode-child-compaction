@@ -1,6 +1,7 @@
 import type { Plugin, PluginInput } from "@opencode-ai/plugin";
 import type { AssistantMessage, Message, Model, Session } from "@opencode-ai/sdk";
 import type { Model as ModelV2 } from "@opencode-ai/sdk/v2/types";
+import { loadSummarizationConfig } from "./config";
 import {
   calculateContextUsage,
   isCompletedNonCompactionAssistantMessage,
@@ -9,9 +10,6 @@ import {
   reachesContextThreshold,
   resolveCompactionThreshold,
 } from "./decision";
-
-const SUMMARIZE_PROVIDER = "openai";
-const SUMMARIZE_MODEL = "gpt-5.6-luna";
 
 function isAssistantMessage(message: Message): message is AssistantMessage {
   return message.role === "assistant";
@@ -48,6 +46,7 @@ async function resolveModelLimit(
 }
 
 export const ChildCompactionPlugin: Plugin = async ({ client }) => {
+  const summarizeConfig = await loadSummarizationConfig(new URL("../config.json", import.meta.url));
   const inFlightSessions = new Set<string>();
 
   return {
@@ -69,8 +68,8 @@ export const ChildCompactionPlugin: Plugin = async ({ client }) => {
         if (!isEligibleChildSession(session)) return;
 
         const summarizeBody = {
-          providerID: SUMMARIZE_PROVIDER,
-          modelID: SUMMARIZE_MODEL,
+          providerID: summarizeConfig.providerID,
+          modelID: summarizeConfig.modelID,
           auto: true,
         };
         await client.session.summarize<true>({

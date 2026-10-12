@@ -1,7 +1,24 @@
-import { expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, test } from "bun:test";
+import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import type { Plugin } from "@opencode-ai/plugin";
 import type { AssistantMessage, Event, Session } from "@opencode-ai/sdk";
 import type { ModelLimit } from "../src/decision";
-import { ChildCompactionPlugin } from "../src/index";
+
+let fixtureRoot: string;
+let ChildCompactionPlugin: Plugin;
+beforeAll(async () => {
+  fixtureRoot = await mkdtemp(join(tmpdir(), "child-compaction-plugin-"));
+  await cp(new URL("../src/", import.meta.url), join(fixtureRoot, "src"), { recursive: true });
+  await writeFile(join(fixtureRoot, "config.json"), JSON.stringify({ providerID: "fixture-provider", modelID: "fixture-model" }));
+  const module: { readonly default: Plugin } = await import(pathToFileURL(join(fixtureRoot, "src/index.ts")).href);
+  ChildCompactionPlugin = module.default;
+});
+afterAll(async () => {
+  await rm(fixtureRoot, { recursive: true, force: true });
+});
 
 type ProviderFixture = {
   readonly providers: readonly {
@@ -129,8 +146,8 @@ test("eligible child summarizes repeatedly after each settled call", async () =>
   await hooks.event?.({ event: event(assistant()) });
   await hooks.event?.({ event: event(assistant({ id: "msg-2" })) });
   expect(calls).toEqual([
-    { providerID: "openai", modelID: "gpt-5.6-luna", auto: true },
-    { providerID: "openai", modelID: "gpt-5.6-luna", auto: true },
+    { providerID: "fixture-provider", modelID: "fixture-model", auto: true },
+    { providerID: "fixture-provider", modelID: "fixture-model", auto: true },
   ]);
 });
 
