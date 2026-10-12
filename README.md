@@ -53,19 +53,49 @@ Missing cache-read or cache-write values count as zero. Only `input`,
 ## Summarization target
 
 When an eligible session reaches the threshold, the plugin calls OpenCode's
-native `session.summarize` operation with this fixed target:
+native `session.summarize` operation with the target from the editable
+`config.json` in the plugin repository/package root, next to `package.json`.
+For a local repository checkout, the path is:
 
 ```text
-providerID: openai
-modelID: gpt-5.6-luna
-auto: true
+config.json
 ```
+
+When installed as a package (for example in `node_modules` via npm or a local `.tgz`), the configuration file is located at the root of the installed package:
+
+```text
+node_modules/@seasyecn/opencode-child-compaction/config.json
+```
+
+The initial configuration is:
+
+```json
+{
+  "providerID": "openai",
+  "modelID": "gpt-5.6-luna"
+}
+```
+
+`providerID` is the OpenCode provider identifier, and `modelID` is the model
+identifier within that provider. The file must contain only these two fields,
+both nonblank strings. The chosen provider/model must already be available in
+OpenCode; this file does not configure endpoints or credentials.
+
+The plugin reads the file from disk once during initialization, relative to
+its entry point (both `src/index.ts` and `dist/index.js` resolve the same root
+file), independent of the working directory. After editing `config.json`,
+quit and restart OpenCode. Later config edits do **not** require rebuilding the
+plugin. There is no hot reload or fallback target. A missing, unreadable, or
+invalid file fails initialization with an error naming the config path and
+required fields.
+
+> **Package Upgrade Note:** Because `config.json` resides directly in the package root, upgrading or reinstalling the package (such as via `npm update`, `npm install`, or installing a newer `.tgz`) will unpack new package files and overwrite `config.json` with the package default. Keep a note or backup of your custom configuration before upgrading.
 
 The per-request `auto: true` flag enables OpenCode's native continuation after
 the summary is created. It applies only to this explicit child-session
 summarize call; it does not enable global automatic compaction.
 
-The `openai/gpt-5.6-luna` model must be configured and available in OpenCode.
+The selected provider/model must be available in OpenCode.
 The plugin does not configure the provider, endpoint, credentials, or model.
 
 ## Repeated and concurrent events
@@ -80,9 +110,52 @@ operation finishes, so separate sessions can be processed independently.
 
 ## Installation
 
-### Published package
+> **Notice:** The public npm registry currently hosts an older `0.1.0` release without configurable model support. This new configurable build is version `0.1.1` and is currently local and **not yet published** to the npm registry. Installing `@seasyecn/opencode-child-compaction` directly from npm will fetch the older `0.1.0` release. For using this configurable `0.1.1` release, follow **Local tarball (`.tgz`) installation** or **Local development**.
 
-Install the published package from npm:
+### Local tarball (`.tgz`) installation (pre-publication)
+
+1. Pack the repository to create the distribution archive:
+
+```sh
+npm pack
+```
+
+This runs `prepack` (building `dist/index.js`) and creates `seasyecn-opencode-child-compaction-0.1.1.tgz` containing `dist/index.js`, `config.json`, `package.json`, and `README.md`.
+
+2. Install the tarball into a chosen directory (for example, OpenCode's configuration directory `~/.config/opencode`):
+
+```sh
+cd ~/.config/opencode
+npm install /path/to/seasyecn-opencode-child-compaction-0.1.1.tgz
+```
+
+*(Do not register `file:///...tgz` directly in the OpenCode `plugin` array; Bun imports `.tgz` archives as file paths rather than ESM plugin modules).*
+
+3. Register the file URL pointing to the installed `dist/index.js` in `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "plugin": [
+    "file:///path/to/node_modules/@seasyecn/opencode-child-compaction/dist/index.js"
+  ]
+}
+```
+
+Merge this entry with any other registered plugins.
+
+4. Edit the target model in the installed package's configuration file as needed:
+
+```text
+node_modules/@seasyecn/opencode-child-compaction/config.json
+```
+
+5. Restart OpenCode to load the plugin.
+
+### Published package (after registry publication of 0.1.1)
+
+*Note: The public npm registry currently has version 0.1.0. Do not use this method for the configurable release until version 0.1.1 is published to npm.*
+
+Once `0.1.1` is published to the registry, install the package from npm:
 
 ```sh
 npm install @seasyecn/opencode-child-compaction
@@ -102,12 +175,12 @@ Register the package name in the existing `plugin` array in
 Merge this entry with any other registered plugins. Restart OpenCode after
 changing the registration.
 
-### Local development
+### Local development (from source)
 
 From the project root, install dependencies and build the plugin:
 
 ```sh
-cd /home/xmz/src/opencode-plugins/opencode-child-compaction
+cd opencode-child-compaction
 bun install
 bun run build
 ```
@@ -118,7 +191,7 @@ Register the built entry point in the existing `plugin` array in
 ```json
 {
   "plugin": [
-    "file:///home/xmz/src/opencode-plugins/opencode-child-compaction/dist/index.js"
+    "file:///path/to/opencode-child-compaction/dist/index.js"
   ]
 }
 ```
@@ -137,9 +210,9 @@ native continuation only on its explicit summarize request:
 }
 ```
 
-The plugin does not change the global compaction setting. Configure
-`openai/gpt-5.6-luna` through the normal OpenCode provider configuration before
-using the plugin.
+The plugin does not change the global compaction setting. Configure the
+provider/model selected in `config.json` through the normal OpenCode provider
+configuration before using the plugin.
 
 ## Development
 
@@ -153,10 +226,10 @@ bun run typecheck
 
 ## Uninstall
 
-1. Remove the `file:///home/xmz/src/opencode-plugins/opencode-child-compaction/dist/index.js`
-   entry from the `plugin` array in `~/.config/opencode/opencode.json`.
+1. Remove the plugin entry (`@seasyecn/opencode-child-compaction`, tarball path/URL, or `file:///.../dist/index.js`)
+   from the `plugin` array in `~/.config/opencode/opencode.json`.
 2. Restart OpenCode.
-3. Remove the project files separately if they are no longer needed.
+3. Remove the package, tarball, or repository files separately if they are no longer needed.
 
 ## Limitations
 
@@ -165,7 +238,7 @@ bun run typecheck
   compaction is started.
 - Compaction is skipped when the completed message's provider/model metadata
   is unavailable or its calculated threshold is not reached.
-- The summarize target is fixed to `openai/gpt-5.6-luna`; that model must be
+- The summarize target comes from `config.json`; that model must be
   configured for native summarization to work.
 - Only child sessions are handled. Root sessions and titles beginning with
   `magic-context-` are excluded.
