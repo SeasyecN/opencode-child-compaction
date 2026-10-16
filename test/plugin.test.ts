@@ -1,197 +1,234 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
-import type { Plugin } from "@opencode-ai/plugin";
-import type { AssistantMessage, Event, Session } from "@opencode-ai/sdk";
-import type { ModelLimit } from "../src/decision";
+import {
+  BELOW_USAGE,
+  OTHER_LOCATION,
+  THRESHOLD_USAGE,
+  assistantEntry,
+  compactionEnded,
+  compactionFailed,
+  compactionInput,
+  compactionStarted,
+  createHarness,
+  fixtureModule,
+  childSession,
+  removeFixtures,
+  sessionDeleted,
+  stepEnded,
+  type CompactionHookInput,
+  type DefinedPlugin,
+  type Harness,
+} from "./support";
 
-let fixtureRoot: string;
-let ChildCompactionPlugin: Plugin;
+let plugin: DefinedPlugin;
+let harness: Harness;
+
 beforeAll(async () => {
-  fixtureRoot = await mkdtemp(join(tmpdir(), "child-compaction-plugin-"));
-  await cp(new URL("../src/", import.meta.url), join(fixtureRoot, "src"), { recursive: true });
-  await writeFile(join(fixtureRoot, "config.json"), JSON.stringify({ providerID: "fixture-provider", modelID: "fixture-model" }));
-  const module: { readonly default: Plugin } = await import(pathToFileURL(join(fixtureRoot, "src/index.ts")).href);
-  ChildCompactionPlugin = module.default;
-});
-afterAll(async () => {
-  await rm(fixtureRoot, { recursive: true, force: true });
-});
-
-type ProviderFixture = {
-  readonly providers: readonly {
-    readonly id: string;
-    readonly models: Readonly<Record<string, { readonly limit: ModelLimit }>>;
-  }[];
-};
-
-type ClientDouble = {
-  readonly session: {
-    readonly get: (input: { readonly path: { readonly id: string } }) => Promise<{ readonly data: Session }>;
-    readonly summarize: (input: { readonly path: { readonly id: string }; readonly body: { readonly providerID: string; readonly modelID: string; readonly auto?: boolean } }) => Promise<unknown>;
-  };
-  readonly config: {
-    readonly providers: () => Promise<{ readonly data?: ProviderFixture }>;
-  };
-};
-
-function assistant(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
-  return {
-    id: "msg-1",
-    sessionID: "child-1",
-    role: "assistant",
-    time: { created: 1, completed: 2 },
-    parentID: "user-1",
-    modelID: "worker",
-    providerID: "openai",
-    mode: "default",
-    path: { cwd: "/tmp", root: "/tmp" },
-    cost: 0,
-    tokens: { input: 200_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-    ...overrides,
-  };
-}
-
-function event(message: AssistantMessage): Event {
-  return { type: "message.updated", properties: { info: message } };
-}
-
-function session(title = "ordinary child"): Session {
-  return { id: "child-1", projectID: "project", directory: "/tmp", parentID: "root", title, version: "1", time: { created: 1, updated: 2 } };
-}
-
-const providerFixture = {
-  providers: [
-    {
-      id: "openai",
-      models: {
-        worker: { limit: { context: 400_000, input: 260_000, output: 128_000 } },
-        small: { limit: { context: 400_000, input: 100_000, output: 128_000 } },
-        fallback: { limit: { context: 400_000, output: 128_000 } },
-      },
-    },
-  ],
-} satisfies ProviderFixture;
-
-async function hooksFor(
-  sessionValue: Session,
-  summarize: ClientDouble["session"]["summarize"] = async () => undefined,
-  providers: ProviderFixture = providerFixture,
-) {
-  const client: ClientDouble = {
-    session: { get: async () => ({ data: sessionValue }), summarize },
-    config: { providers: async () => ({ data: providers }) },
-  };
-  return ChildCompactionPlugin({ client } as Parameters<typeof ChildCompactionPlugin>[0]);
-}
-
-test("parent session is excluded", async () => {
-  let count = 0;
-  const rootSession: Session = {
-    id: "child-1",
-    projectID: "project",
-    directory: "/tmp",
-    title: "ordinary child",
-    version: "1",
-    time: { created: 1, updated: 2 },
-  };
-  const hooks = await hooksFor(rootSession, async () => { count += 1; });
-  await hooks.event?.({ event: event(assistant()) });
-  expect(count).toBe(0);
-});
-
-test("Magic Context child is excluded", async () => {
-  let count = 0;
-  const hooks = await hooksFor(session("magic-context-123"), async () => { count += 1; });
-  await hooks.event?.({ event: event(assistant()) });
-  expect(count).toBe(0);
-});
-
-test("below threshold is excluded", async () => {
-  let count = 0;
-  const hooks = await hooksFor(session(), async () => { count += 1; });
-  await hooks.event?.({ event: event(assistant({ tokens: { input: 194_999, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } })) });
-  expect(count).toBe(0);
-});
-
-test("completed model input limit controls the threshold", async () => {
-  let count = 0;
-  const hooks = await hooksFor(session(), async () => { count += 1; });
-  await hooks.event?.({
-    event: event(assistant({
-      providerID: "openai",
-      modelID: "small",
-      tokens: { input: 75_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-    })),
+  const module = await fixtureModule({
+    entry: "src",
+    config: { providerID: "fixture-provider", modelID: "fixture-model" },
   });
-  expect(count).toBe(1);
+  plugin = module.default;
 });
 
-test("missing model metadata skips compaction", async () => {
-  let count = 0;
-  const hooks = await hooksFor(
-    session(),
-    async () => { count += 1; },
-    { providers: [{ id: "other", models: {} }] },
-  );
-  await hooks.event?.({ event: event(assistant()) });
-  expect(count).toBe(0);
+afterAll(async () => {
+  await removeFixtures();
 });
 
-test("eligible child summarizes repeatedly after each settled call", async () => {
-  const calls: Array<{ readonly providerID: string; readonly modelID: string; readonly auto?: boolean }> = [];
-  const hooks = await hooksFor(session(), async (input) => { calls.push(input.body); });
-  await hooks.event?.({ event: event(assistant()) });
-  await hooks.event?.({ event: event(assistant({ id: "msg-2" })) });
-  expect(calls).toEqual([
-    { providerID: "fixture-provider", modelID: "fixture-model", auto: true },
-    { providerID: "fixture-provider", modelID: "fixture-model", auto: true },
+async function fresh(): Promise<Harness> {
+  return (harness = await createHarness((context) => plugin.setup(context)));
+}
+
+function invokeCompactionHook(input: CompactionHookInput): Promise<void> {
+  const hook = harness.compactionHooks[0];
+  if (!hook) throw new Error("fixture: compaction hook was not registered");
+  return hook(input as never) as Promise<void>;
+}
+
+test("an eligible child at threshold schedules one compaction with a steer delivery and idempotent id", async () => {
+  const context = await fresh();
+  context.registerSession(childSession());
+  context.push(stepEnded("child-1", "child-1-assistant-1"));
+  await context.waitFor(() => context.logs.compact.length === 1, "compaction submission");
+
+  const submission = context.logs.compact[0];
+  expect(submission?.sessionID).toBe("child-1");
+  expect(submission?.id).toStartWith("msg_");
+  expect(submission?.delivery).toBe("steer");
+  expect(context.compactionHooks.length).toBe(1);
+});
+
+test("the compaction hook summarizes with the configured model and a legal result shape", async () => {
+  const context = await fresh();
+  context.registerSession(childSession());
+  context.push(stepEnded("child-1", "child-1-assistant-1"));
+  // The hook must run while the scheduled compaction is the admitted, running one.
+  await context.waitFor(() => context.logs.compact.length === 1, "compaction submission");
+
+  const input = compactionInput("child-1");
+  await invokeCompactionHook(input);
+
+  const generate = context.logs.generate[0];
+  expect(generate?.model).toEqual({ providerID: "fixture-provider", id: "fixture-model" });
+  expect(generate?.prompt).toContain("fixture user request");
+  expect(generate?.prompt).toContain("fixture assistant reply");
+  expect(input.result?.summary).toBe("fixture summary");
+  expect(input.result?.metadata).toEqual({
+    childCompaction: { providerID: "fixture-provider", modelID: "fixture-model" },
+  });
+  expect(Object.keys(input.result ?? {}).every((key) =>
+    ["summary", "providerState", "metadata", "tokens"].includes(key),
+  )).toBe(true);
+});
+
+test("the compaction hook leaves compactions it did not schedule untouched", async () => {
+  const context = await fresh();
+  const input = compactionInput("unrelated-1");
+  await invokeCompactionHook(input);
+  expect(input.result).toBeUndefined();
+  expect(context.logs.generate.length).toBe(0);
+});
+
+test("a generate failure fails the hook and a failed compaction releases the session", async () => {
+  const context = await fresh();
+  context.registerSession(childSession());
+  context.push(stepEnded("child-1", "child-1-assistant-1"));
+  await context.waitFor(() => context.logs.compact.length === 1, "compaction submission");
+
+  context.knobs.generate = { kind: "reject", error: new Error("provider down") };
+  const input = compactionInput("child-1");
+  const hooked = invokeCompactionHook(input);
+  hooked.catch(() => {});
+  await expect(hooked).rejects.toThrow("failed or was cancelled");
+  expect(input.result).toBeUndefined();
+
+  context.push(compactionFailed("child-1", context.logs.compact[0]?.id ?? ""));
+  context.finishCompaction("child-1");
+  context.knobs.generate = { kind: "text", text: "fixture summary" };
+  context.appendMessage("child-1", { ...assistantEntry({ id: "child-1-assistant-2" }) });
+  context.push(stepEnded("child-1", "child-1-assistant-2"));
+  await context.waitFor(() => context.logs.compact.length === 2, "compaction after failure release");
+});
+
+test("compaction admission is not completion: deduplication holds until the terminal event", async () => {
+  const context = await fresh();
+  context.registerSession(childSession());
+  context.push(stepEnded("child-1", "child-1-assistant-1"));
+  await context.waitFor(() => context.logs.compact.length === 1, "compaction submission");
+
+  context.push(stepEnded("child-1", "child-1-assistant-2"));
+  await context.tick();
+  expect(context.logs.compact.length).toBe(1);
+
+  context.push(compactionStarted("child-1", context.logs.compact[0]?.id ?? ""));
+  context.push(compactionEnded("child-1"));
+  context.finishCompaction("child-1");
+  context.appendMessage("child-1", { ...assistantEntry({ id: "child-1-assistant-3" }) });
+  context.push(stepEnded("child-1", "child-1-assistant-3"));
+  await context.waitFor(() => context.logs.compact.length === 2, "compaction after release");
+});
+
+test("duplicate step-ended events for one child trigger a single compaction", async () => {
+  const context = await fresh();
+  context.registerSession(childSession());
+  context.push(stepEnded("child-1", "child-1-assistant-1"));
+  context.push(stepEnded("child-1", "child-1-assistant-1"));
+  await context.waitFor(() => context.logs.compact.length === 1, "compaction submission");
+  await context.tick();
+  expect(context.logs.compact.length).toBe(1);
+});
+
+test("different children proceed concurrently without blocking each other", async () => {
+  const context = await fresh();
+  const gate = Promise.withResolvers<void>();
+  context.registerSession(childSession({ id: "child-a" }));
+  context.registerSession(childSession({ id: "child-b" }));
+  context.knobs.getGates.set("child-a", gate.promise);
+
+  context.push(stepEnded("child-a", "child-a-assistant-1"));
+  context.push(stepEnded("child-b", "child-b-assistant-1"));
+  await context.waitFor(() => context.logs.compact.some((call) => call.sessionID === "child-b"), "child-b compaction");
+  expect(context.logs.compact.some((call) => call.sessionID === "child-a")).toBe(false);
+
+  gate.resolve();
+  await context.waitFor(() => context.logs.compact.length === 2, "child-a compaction after gate release");
+});
+
+test("parent, Magic Context, below-threshold, incomplete, foreign-directory, and errored steps are excluded", async () => {
+  const context = await fresh();
+
+  const rootSession = childSession({ id: "root-1", title: "ordinary root" });
+  delete (rootSession as { parentID?: string }).parentID;
+  context.registerSession(rootSession);
+  context.registerSession(childSession({ id: "magic-1", title: "magic-context-abc" }));
+  context.registerSession(childSession());
+  context.registerSession(childSession({ id: "late-1" }), [
+    { ...{ id: "late-1-assistant-2" }, type: "assistant", agent: "worker", model: { providerID: "worker-provider", id: "worker" }, content: [], time: { created: 1 } },
   ]);
+  context.registerSession(childSession({ id: "dir-2", location: { directory: OTHER_LOCATION } }));
+
+  context.push(stepEnded("root-1", "root-1-assistant-1"));
+  context.push(stepEnded("magic-1", "magic-1-assistant-1"));
+  context.push(stepEnded("child-1", "assistant-below", { tokens: BELOW_USAGE }));
+  context.push(stepEnded("late-1", "late-1-assistant-2"));
+  context.push(stepEnded("dir-2", "dir-2-assistant-1"));
+  context.push(stepEnded("child-1", "assistant-errored", { finish: "error" }));
+  await context.tick();
+
+  expect(context.logs.compact.length).toBe(0);
+  expect(context.logs.generate.length).toBe(0);
 });
 
-test("eligible child requests native auto-continuation after summarize", async () => {
-  const requests: Array<Parameters<ClientDouble["session"]["summarize"]>[0]["body"]> = [];
-  const hooks = await hooksFor(session(), async (input) => { requests.push(input.body); });
-  await hooks.event?.({ event: event(assistant()) });
-  expect(requests[0]?.auto).toBe(true);
+test("cache read and write tokens count toward the threshold", async () => {
+  const context = await fresh();
+  context.registerSession(childSession());
+  context.push(stepEnded("child-1", "child-1-assistant-1", {
+    tokens: { input: 95_000, output: 0, reasoning: 0, cache: { read: 99_000, write: 1_000 } },
+  }));
+  await context.waitFor(() => context.logs.compact.length === 1, "compaction submission");
 });
 
-test("cache-read contributes to threshold", async () => {
-  let count = 0;
-  const hooks = await hooksFor(session(), async () => { count += 1; });
-  await hooks.event?.({ event: event(assistant({ tokens: { input: 14_811, output: 0, reasoning: 0, cache: { read: 185_189, write: 0 } } })) });
-  expect(count).toBe(1);
+test("below-threshold usage with cache tokens stays under the 75% budget", async () => {
+  const context = await fresh();
+  context.registerSession(childSession());
+  context.push(stepEnded("child-1", "child-1-assistant-1", { tokens: { input: THRESHOLD_USAGE.input, output: 0, reasoning: 0, cache: { read: 4_999, write: 0 } } }));
+  await context.tick();
+  expect(context.logs.compact.length).toBe(0);
 });
 
-test("compaction summary is excluded", async () => {
-  let count = 0;
-  const hooks = await hooksFor(session(), async () => { count += 1; });
-  await hooks.event?.({ event: event(assistant({ summary: true })) });
-  expect(count).toBe(0);
+test("session deletion releases pending deduplication without a terminal compaction event", async () => {
+  const context = await fresh();
+  const gate = Promise.withResolvers<void>();
+  context.registerSession(childSession({ id: "child-gone" }));
+  context.knobs.getGates.set("child-gone", gate.promise);
+  context.push(stepEnded("child-gone", "child-gone-assistant-1"));
+  await context.tick();
+  context.push(sessionDeleted("child-gone"));
+  gate.resolve();
+  await context.tick();
+  expect(context.logs.compact.length).toBe(0);
+
+  context.registerSession(childSession({ id: "child-2" }));
+  context.push(stepEnded("child-2", "child-2-assistant-1"));
+  await context.waitFor(() => context.logs.compact.length === 1, "compaction after deleted child");
 });
 
-test("user messages are excluded", async () => {
-  const hooks = await hooksFor(session());
-  const userEvent = { type: "message.updated", properties: { info: { role: "user" } } } as Event;
-  await hooks.event?.({ event: userEvent });
-});
+test("cleanup aborts in-flight summaries, disposes registrations, and stops processing", async () => {
+  const context = await fresh();
+  context.registerSession(childSession());
+  context.push(stepEnded("child-1", "child-1-assistant-1"));
+  await context.waitFor(() => context.logs.compact.length === 1, "compaction submission");
 
-test("concurrent duplicate events summarize once while the first call is pending", async () => {
-	let count = 0;
-	const summarizeStarted = Promise.withResolvers<void>();
-	const summarizeGate = Promise.withResolvers<void>();
-	const hooks = await hooksFor(session(), async () => {
-		count += 1;
-		summarizeStarted.resolve();
-		await summarizeGate.promise;
-	});
-	const first = hooks.event?.({ event: event(assistant()) });
-	await summarizeStarted.promise;
-	const second = hooks.event?.({ event: event(assistant({ id: "msg-2" })) });
-	await second;
-	expect(count).toBe(1);
-	summarizeGate.resolve();
-	await first;
+  const stuckGate = new Promise<void>(() => {});
+  context.knobs.generate = { kind: "gate", gate: stuckGate, text: "late summary" };
+  const hooked = invokeCompactionHook(compactionInput("child-1"));
+  hooked.catch(() => {});
+  await context.waitFor(() => context.logs.generate.length === 1, "generate dispatch");
+
+  await context.cleanup();
+  expect(context.logs.generate[0]?.signal?.aborted).toBe(true);
+  expect(context.disposeCount()).toBeGreaterThan(0);
+
+  context.push(stepEnded("child-1", "child-1-assistant-2"));
+  await context.tick();
+  expect(context.logs.compact.length).toBe(1);
 });

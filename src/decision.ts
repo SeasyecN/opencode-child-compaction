@@ -19,19 +19,18 @@ export type ModelLimit = {
 
 export type SessionMetadata = {
   readonly parentID?: string;
-  readonly title: string;
+  readonly title?: string;
 };
 
 export type AssistantMessageMetadata = {
-  readonly role: "assistant";
-  readonly summary?: boolean;
+  readonly type: "assistant";
   readonly time: {
     readonly completed?: number;
   };
 };
 
 export type UserMessageMetadata = {
-  readonly role: "user";
+  readonly type: "user" | "compaction";
   readonly time: {
     readonly completed?: number;
   };
@@ -48,6 +47,7 @@ export function resolveCompactionThreshold(
 ): number | undefined {
   if (!limit) return undefined;
   const effectiveInputLimit = limit.input ?? limit.context - limit.output;
+  if (!Number.isFinite(effectiveInputLimit) || effectiveInputLimit <= 0) return undefined;
   return Math.floor(effectiveInputLimit * COMPACTION_THRESHOLD_RATIO);
 }
 
@@ -58,7 +58,7 @@ export function reachesContextThreshold(usage: number, threshold: number): boole
 export function isEligibleChildSession(session: SessionMetadata): boolean {
   return (
     session.parentID !== undefined &&
-    !session.title.startsWith(MAGIC_CONTEXT_TITLE_PREFIX)
+    !session.title?.startsWith(MAGIC_CONTEXT_TITLE_PREFIX)
   );
 }
 
@@ -66,8 +66,7 @@ export function isCompletedNonCompactionAssistantMessage(
   message: MessageMetadata,
 ): boolean {
   return (
-    message.role === "assistant" &&
-    message.time.completed !== undefined &&
-    message.summary !== true
+    message.type === "assistant" &&
+    message.time.completed !== undefined
   );
 }

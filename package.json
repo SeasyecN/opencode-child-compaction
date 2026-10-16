@@ -1,6 +1,6 @@
 {
   "name": "@seasyecn/opencode-child-compaction",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "OpenCode plugin that compacts eligible child sessions at an adaptive context threshold.",
   "repository": {
     "type": "git",
@@ -9,7 +9,8 @@
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
-    ".": "./dist/index.js"
+    ".": "./dist/index.js",
+    "./config.json": "./config.json"
   },
   "files": [
     "dist",
@@ -22,12 +23,13 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "build": "bun build ./src/index.ts --outdir ./dist --target bun --format esm --external @opencode-ai/plugin --external @opencode-ai/sdk",
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun --format esm --external @opencode/plugin",
     "prepack": "bun run build"
   },
+  "dependencies": {
+    "@opencode/plugin": "2.0.30"
+  },
   "devDependencies": {
-    "@opencode-ai/plugin": "1.18.23",
-    "@opencode-ai/sdk": "1.18.23",
     "@types/bun": "latest",
     "typescript": "^5"
   }

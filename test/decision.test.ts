@@ -88,21 +88,20 @@ test("isEligibleChildSession accepts an ordinary child", () => {
 
 test("isCompletedNonCompactionAssistantMessage accepts a completed assistant message", () => {
 	const message = {
-		role: "assistant",
+		type: "assistant",
 		time: { completed: 1 },
 	} satisfies AssistantMessageMetadata;
 
 	expect(isCompletedNonCompactionAssistantMessage(message)).toBe(true);
 });
 
-test("isCompletedNonCompactionAssistantMessage excludes compaction messages", () => {
-	const compactionMessage = {
-		role: "assistant",
-		summary: true,
+test("isCompletedNonCompactionAssistantMessage excludes non-assistant messages", () => {
+	const compactionControl = {
+		type: "compaction",
 		time: { completed: 1 },
 	} satisfies MessageMetadata;
 
-	expect(isCompletedNonCompactionAssistantMessage(compactionMessage)).toBe(
+	expect(isCompletedNonCompactionAssistantMessage(compactionControl)).toBe(
 		false,
 	);
 });

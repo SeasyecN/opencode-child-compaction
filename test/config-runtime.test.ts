@@ -1,105 +1,94 @@
 import { afterEach, expect, test } from "bun:test";
-import { $ } from "bun";
-import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { existsSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
-import type { Plugin, PluginInput } from "@opencode-ai/plugin";
-import { createOpencodeClient, type Event } from "@opencode-ai/sdk";
+import { Plugin } from "@opencode/plugin";
+import {
+  compactionInput,
+  createHarness,
+  fixtureModule,
+  removeFixtures,
+  stepEnded,
+  type Harness,
+} from "./support";
+import { childSession } from "./support";
 
-const roots: string[] = [];
 afterEach(async () => {
-  await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  await removeFixtures();
 });
 
-async function fixture(entry: "src" | "dist", config: string | undefined) {
-  const root = await mkdtemp(join(tmpdir(), "child-compaction-config-"));
-  roots.push(root);
-  await cp(new URL(`../${entry}/`, import.meta.url), join(root, entry), { recursive: true });
-  const configPath = join(root, "config.json");
-  if (config !== undefined) await writeFile(configPath, config);
-  const module: { readonly default: Plugin } = await import(
-    pathToFileURL(join(root, entry, entry === "src" ? "index.ts" : "index.js")).href
-  );
-  return { plugin: module.default, configPath };
-}
+const distEntry = join(import.meta.dir, "..", "dist", "index.js");
 
-function inputFor(requests: unknown[]): PluginInput {
-  const client = createOpencodeClient({
-    baseUrl: "http://fixture.invalid",
-    fetch: async (request) => {
-      const path = new URL(request.url).pathname;
-      if (path === "/config/providers") {
-        return Response.json({ providers: [{ id: "worker-provider", models: {
-          worker: { limit: { context: 400_000, input: 260_000, output: 128_000 } },
-        } }] });
-      }
-      if (path === "/session/child-1" && request.method === "GET") {
-        return Response.json({ id: "child-1", parentID: "root", title: "ordinary child" });
-      }
-      if (path === "/session/child-1/summarize" && request.method === "POST") {
-        const body: unknown = await request.json();
-        requests.push(body);
-        return Response.json(true);
-      }
-      throw new Error(`Unexpected fixture request: ${request.method} ${path}`);
-    },
+async function summaryTarget(entry: "src" | "dist"): Promise<{
+  harness: Harness;
+  model: Harness["logs"]["generate"][number]["model"];
+}> {
+  const module = await fixtureModule({
+    entry,
+    config: { providerID: "custom-provider", modelID: "custom-model" },
   });
-  return {
-    client,
-    project: { id: "project", worktree: tmpdir(), time: { created: 1 } },
-    directory: tmpdir(),
-    worktree: tmpdir(),
-    experimental_workspace: { register: () => undefined },
-    serverUrl: new URL("http://fixture.invalid"),
-    $,
-  };
-}
+  const harness = await createHarness((context) => module.default.setup(context));
+  harness.registerSession(childSession());
+  harness.push(stepEnded("child-1", "child-1-assistant-1"));
+  await harness.waitFor(() => harness.logs.compact.length === 1, "compaction submission");
 
-const completedEvent = {
-  type: "message.updated",
-  properties: { info: {
-    id: "msg-1", sessionID: "child-1", role: "assistant",
-    time: { created: 1, completed: 2 }, parentID: "user-1",
-    modelID: "worker", providerID: "worker-provider", mode: "default",
-    path: { cwd: "/tmp", root: "/tmp" }, cost: 0,
-    tokens: { input: 200_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-  } },
-} satisfies Event;
+  const input = compactionInput("child-1");
+  const hook = harness.compactionHooks[0];
+  if (!hook) throw new Error("fixture: compaction hook was not registered");
+  await hook(input as never);
+  return { harness, model: harness.logs.generate[0]?.model };
+}
 
 for (const entry of ["src", "dist"] as const) {
-  test(`${entry} uses configured provider/model when an eligible event arrives`, async () => {
-    // Given an isolated plugin outside cwd and a target different from the old constants.
-    const { plugin } = await fixture(entry, JSON.stringify({ providerID: "custom-provider", modelID: "custom-model" }));
-    const requests: unknown[] = [];
-    const hooks = await plugin(inputFor(requests));
-    // When a completed eligible child event reaches the threshold.
-    await hooks.event?.({ event: completedEvent });
-    // Then the real SDK sends the configured target on the wire.
-    expect(requests).toEqual([{ providerID: "custom-provider", modelID: "custom-model", auto: true }]);
+  const entryFile = join(import.meta.dir, "..", entry, entry === "src" ? "index.ts" : "index.js");
+  const available = existsSync(entryFile);
+
+  test(`${entry} sends the configured provider and model to the summary generator`, async () => {
+    if (!available) return;
+    const { harness, model } = await summaryTarget(entry);
+    await harness.cleanup();
+    expect(model).toEqual({ providerID: "custom-provider", id: "custom-model" });
   });
 
-  test(`${entry} reads edits without rebuilding when reinitialized`, async () => {
-    // Given an initialized plugin whose isolated config is subsequently edited.
-    const { plugin, configPath } = await fixture(entry, JSON.stringify({ providerID: "first-provider", modelID: "first-model" }));
-    const requests: unknown[] = [];
-    const input = inputFor(requests);
-    const original = await plugin(input);
-    await writeFile(configPath, JSON.stringify({ providerID: "second-provider", modelID: "second-model" }));
-    // When existing and newly initialized hooks handle qualifying events, without a build.
-    const restarted = await plugin(input);
-    await original.event?.({ event: completedEvent });
-    await restarted.event?.({ event: completedEvent });
-    // Then existing hooks retain their target and new hooks read the edited file.
-    expect(requests).toEqual([
-      { providerID: "first-provider", modelID: "first-model", auto: true },
-      { providerID: "second-provider", modelID: "second-model", auto: true },
-    ]);
+  test(`${entry} keeps the loaded target and reads edits only when setup runs again`, async () => {
+    if (!available) return;
+    const module = await fixtureModule({
+      entry,
+      config: { providerID: "first-provider", modelID: "first-model" },
+    });
+    const original = await createHarness((context) => module.default.setup(context));
+
+    // First instance keeps its setup-time target even after the file changes.
+    await writeFile(module.configPath, JSON.stringify({ providerID: "second-provider", modelID: "second-model" }));
+    original.registerSession(childSession());
+    original.push(stepEnded("child-1", "child-1-assistant-1"));
+    await original.waitFor(() => original.logs.compact.length === 1, "original compaction");
+    const firstInput = compactionInput("child-1");
+    await original.compactionHooks[0]?.(firstInput as never);
+    expect(firstInput.result?.summary).toBe("fixture summary");
+    expect(original.logs.generate[0]?.model).toEqual({ providerID: "first-provider", id: "first-model" });
+
+    // A fresh setup reads the edited file.
+    const restarted = await createHarness((context) => module.default.setup(context));
+    restarted.registerSession(childSession({ id: "child-2" }));
+    restarted.push(stepEnded("child-2", "child-2-assistant-1"));
+    await restarted.waitFor(() => restarted.logs.compact.length === 1, "restarted compaction");
+    const secondInput = compactionInput("child-2");
+    await restarted.compactionHooks[0]?.(secondInput as never);
+    expect(restarted.logs.generate[0]?.model).toEqual({ providerID: "second-provider", id: "second-model" });
+
+    await original.cleanup();
+    await restarted.cleanup();
   });
 
   const invalidConfigs = [
-    undefined, "{", "null", "[]", "{}",
-    '{"providerID":"p"}', '{"providerID":3,"modelID":"m"}',
+    undefined,
+    "{",
+    "null",
+    "[]",
+    "{}",
+    '{"providerID":"p"}',
+    '{"providerID":3,"modelID":"m"}',
     '{"providerID":"p","modelID":false}',
     '{"providerID":"  ","modelID":"m"}',
     '{"providerID":"p","modelID":"\\t"}',
@@ -107,13 +96,16 @@ for (const entry of ["src", "dist"] as const) {
   ] as const;
   for (const config of invalidConfigs) {
     test(`${entry} rejects initialization when config is ${config ?? "missing"}`, async () => {
-      // Given a missing or invalid isolated config.
-      const { plugin, configPath } = await fixture(entry, config);
-      // When initialization runs, then it fails with the path and required fields.
-      const initialization = plugin(inputFor([]));
-      await expect(initialization).rejects.toThrow(configPath);
+      const module = await fixtureModule({ entry, config });
+      // setup reads config.json before touching any API, so an empty context is safe here.
+      const initialization = module.default.setup({} as unknown as Plugin.Context);
+      await expect(initialization).rejects.toThrow(module.configPath);
       await expect(initialization).rejects.toThrow("providerID");
       await expect(initialization).rejects.toThrow("modelID");
     });
   }
 }
+
+test("the shipped dist entrypoint exists for packaging", () => {
+  expect(existsSync(distEntry)).toBe(true);
+});

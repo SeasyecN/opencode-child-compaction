@@ -1,73 +1,114 @@
 # OpenCode Child Compaction
 
-An OpenCode plugin that summarizes eligible child sessions when a completed
-assistant turn reaches an adaptive context threshold. It uses OpenCode's native
-session summarize operation and is designed for child sessions only.
+An OpenCode V2 plugin that compacts eligible child sessions when a completed
+assistant turn reaches an adaptive context threshold, writing the summary with
+a dedicated summarization model instead of the child's own model.
+
+Built against `@opencode/plugin@2.0.30` for OpenCode `2.0.30`. The V1 plugin
+API (`@opencode-ai/plugin`) is not supported by this release.
 
 ## Behavior
 
-The plugin listens for `message.updated` events. It considers an event only
-when the message is:
-
-- an assistant message;
-- completed, with `time.completed` set; and
-- not a compaction summary, with `summary !== true`.
-
-For a qualifying message, it reads the provider and model metadata for the
-model that produced that message. Missing provider or model metadata causes
-the event to be skipped.
+The plugin subscribes to the server event stream and considers
+`session.step.ended` events. An event qualifies only when the step produced a
+completed assistant message that is still visible in the session context, and
+the message's model has known limits.
 
 ### Session scope
 
-After the threshold check, the plugin fetches the session and compacts it only
-when:
+- Only child sessions (a session with a `parentID`) are compacted.
+- Titles starting with `magic-context-` are excluded, so Magic Context children
+  are never touched.
+- Sessions outside the plugin's own location directory are ignored.
 
-- the session has a `parentID`; and
-- its title does not start with `magic-context-`.
-
-Root sessions and sessions with titles starting with `magic-context-` are
-excluded. User messages, incomplete assistant messages, and compaction summary
-messages are also ignored by the event filter.
-
-## Adaptive threshold
+### Adaptive threshold
 
 The threshold is calculated from the limits of the model that produced the
 completed assistant message:
 
 ```text
 effective input limit = limit.input
-                         or (limit.context - limit.output)
+                        or (limit.context - limit.output)
 threshold = floor(effective input limit * 0.75)
 ```
 
 The plugin compacts when the measured usage is greater than or equal to that
-threshold. Measured usage is:
+threshold. Measured usage is the step's effective input budget:
 
 ```text
-usage = input + cache.read + cache.write
+usage = tokens.input + tokens.cache.read + tokens.cache.write
 ```
 
-Missing cache-read or cache-write values count as zero. Only `input`,
-`cache.read`, and `cache.write` contribute to this decision.
+Only these fields contribute to the decision; the 75% ratio reserves the
+remaining quarter of the input budget for prompt growth.
 
-## Summarization target
+## Scheduling and deduplication
 
-When an eligible session reaches the threshold, the plugin calls OpenCode's
-native `session.summarize` operation with the target from the editable
-`config.json` in the plugin repository/package root, next to `package.json`.
-For a local repository checkout, the path is:
+For each qualifying event the plugin submits one compaction request through
+`ctx.session.compact({ sessionID, id, delivery: "steer" })`. The `id` is
+generated per pending operation, so repeated submissions are idempotent on the
+server side.
+
+OpenCode returns the admitted compaction inbox item, not a finished summary:
+admission is not completion. The in-flight marker for a child is held until a
+public, terminal compaction event proves the outcome —
+`session.compaction.ended`, `session.compaction.failed`,
+`session.inbox.cancelled`, an execution interruption after the compaction
+started, or `session.deleted`. Until then, duplicate step events for the same
+child are ignored. After a failure the marker is released, so a later
+qualifying event can schedule the compaction again. Different children are
+processed concurrently; the event loop never waits on one child's work.
+
+## Summarization model
+
+`compact()` in OpenCode 2 does not accept a model override, and the plugin
+does not write messages or database state directly. Instead it uses the
+documented V2 extension point: a `compaction` session hook. When the host runs
+a compaction that matches one of this plugin's pending requests, the hook
+serializes the transcript being summarized, calls `ctx.generate.text()` with
+the target from `config.json`, and sets `event.result`:
+
+```ts
+await ctx.session.hook("compaction", async (event) => {
+  event.result = { summary: await summarize(event.messages) };
+})
+```
+
+Setting `result` records the compaction and makes the host skip its native
+compaction model call. The plugin sets only the fields the OpenCode 2.0.30
+schema allows for a completed compaction result: `summary` plus a `metadata`
+annotation identifying the summarizer:
+
+```json
+{
+  "summary": "…",
+  "metadata": { "childCompaction": { "providerID": "openai", "modelID": "gpt-5.6-luna" } }
+}
+```
+
+Compactions the plugin did not schedule (manual compaction of a parent
+session, auto compaction, other plugins' requests) pass through the hook
+untouched, so only this plugin's child compactions use the custom model. A
+summary failure fails that compaction attempt instead of silently falling back
+to another model. Resuming the child after compaction remains the host's
+decision, exactly as with a native model-generated summary.
+
+The target model is read from `config.json` in the plugin repository/package
+root, next to `package.json`:
 
 ```text
 config.json
 ```
 
-When installed as a package (for example in `node_modules` via npm or a local `.tgz`), the configuration file is located at the root of the installed package:
+When installed as a package (for example in `node_modules` via npm or a local
+`.tgz`), the configuration file is located at the root of the installed
+package:
 
 ```text
 node_modules/@seasyecn/opencode-child-compaction/config.json
 ```
 
-The initial configuration is:
+The shipped default is:
 
 ```json
 {
@@ -81,38 +122,24 @@ identifier within that provider. The file must contain only these two fields,
 both nonblank strings. The chosen provider/model must already be available in
 OpenCode; this file does not configure endpoints or credentials.
 
-The plugin reads the file from disk once during initialization, relative to
-its entry point (both `src/index.ts` and `dist/index.js` resolve the same root
-file), independent of the working directory. After editing `config.json`,
-quit and restart OpenCode. Later config edits do **not** require rebuilding the
-plugin. There is no hot reload or fallback target. A missing, unreadable, or
-invalid file fails initialization with an error naming the config path and
-required fields.
+The plugin reads the file once during `setup`, relative to its bundled entry
+point and independent of the working directory. After editing `config.json`,
+restart OpenCode (or reload the plugin) so a new `setup` reads the edit. A
+missing, unreadable, or invalid file fails plugin initialization with an error
+naming the config path and required fields.
 
-> **Package Upgrade Note:** Because `config.json` resides directly in the package root, upgrading or reinstalling the package (such as via `npm update`, `npm install`, or installing a newer `.tgz`) will unpack new package files and overwrite `config.json` with the package default. Keep a note or backup of your custom configuration before upgrading.
-
-The per-request `auto: true` flag enables OpenCode's native continuation after
-the summary is created. It applies only to this explicit child-session
-summarize call; it does not enable global automatic compaction.
-
-The selected provider/model must be available in OpenCode.
-The plugin does not configure the provider, endpoint, credentials, or model.
-
-## Repeated and concurrent events
-
-There is no one-time latch per session. After an in-flight operation finishes,
-including when it fails, a later qualifying completed assistant event can
-trigger another summarize call if the threshold is still reached.
-
-While a summarize operation is pending, duplicate events for the same session
-are ignored. The in-flight marker is per session and is cleared when the
-operation finishes, so separate sessions can be processed independently.
+> **Package upgrade note:** `config.json` lives in the package root, so
+> upgrading or reinstalling the package (npm update/install, a newer `.tgz`)
+> overwrites it with the package default. Back up custom settings before
+> upgrading.
 
 ## Installation
 
-> **Notice:** The public npm registry currently hosts an older `0.1.0` release without configurable model support. This new configurable build is version `0.1.1` and is currently local and **not yet published** to the npm registry. Installing `@seasyecn/opencode-child-compaction` directly from npm will fetch the older `0.1.0` release. For using this configurable `0.1.1` release, follow **Local tarball (`.tgz`) installation** or **Local development**.
+> The npm registry currently hosts the V1-based `0.1.0`/`0.1.1` releases.
+> Version `0.2.0` (this release) is not published yet; until then, install
+> from a local tarball or a local checkout.
 
-### Local tarball (`.tgz`) installation (pre-publication)
+### Local tarball (pre-publication)
 
 1. Pack the repository to create the distribution archive:
 
@@ -120,64 +147,54 @@ operation finishes, so separate sessions can be processed independently.
 npm pack
 ```
 
-This runs `prepack` (building `dist/index.js`) and creates `seasyecn-opencode-child-compaction-0.1.1.tgz` containing `dist/index.js`, `config.json`, `package.json`, and `README.md`.
+This runs `prepack` (building `dist/index.js`) and creates
+`seasyecn-opencode-child-compaction-0.2.0.tgz` containing `dist/index.js`,
+`config.json`, `package.json`, and `README.md`.
 
-2. Install the tarball into a chosen directory (for example, OpenCode's configuration directory `~/.config/opencode`):
+2. Install the tarball into OpenCode's configuration directory:
 
 ```sh
 cd ~/.config/opencode
-npm install /path/to/seasyecn-opencode-child-compaction-0.1.1.tgz
+npm install /path/to/seasyecn-opencode-child-compaction-0.2.0.tgz
 ```
 
-*(Do not register `file:///...tgz` directly in the OpenCode `plugin` array; Bun imports `.tgz` archives as file paths rather than ESM plugin modules).*
-
-3. Register the file URL pointing to the installed `dist/index.js` in `~/.config/opencode/opencode.json`:
+3. Register the package in the `plugins` array (the V2 configuration key, not
+   the V1 `plugin` key) in `~/.config/opencode/opencode.json`:
 
 ```json
 {
-  "plugin": [
-    "file:///path/to/node_modules/@seasyecn/opencode-child-compaction/dist/index.js"
-  ]
-}
-```
-
-Merge this entry with any other registered plugins.
-
-4. Edit the target model in the installed package's configuration file as needed:
-
-```text
-node_modules/@seasyecn/opencode-child-compaction/config.json
-```
-
-5. Restart OpenCode to load the plugin.
-
-### Published package (after registry publication of 0.1.1)
-
-*Note: The public npm registry currently has version 0.1.0. Do not use this method for the configurable release until version 0.1.1 is published to npm.*
-
-Once `0.1.1` is published to the registry, install the package from npm:
-
-```sh
-npm install @seasyecn/opencode-child-compaction
-```
-
-Register the package name in the existing `plugin` array in
-`~/.config/opencode/opencode.json`:
-
-```json
-{
-  "plugin": [
+  "plugins": [
     "@seasyecn/opencode-child-compaction"
   ]
 }
 ```
 
-Merge this entry with any other registered plugins. Restart OpenCode after
-changing the registration.
+Alternatively, register the built entrypoint directly:
+
+```json
+{
+  "plugins": [
+    "file:///path/to/node_modules/@seasyecn/opencode-child-compaction/dist/index.js"
+  ]
+}
+```
+
+4. Edit the summarization target in the installed package's `config.json` if
+   the default does not suit your setup, then restart OpenCode to load the
+   plugin.
+
+### Published package
+
+Once `0.2.0` is published to the registry:
+
+```sh
+npm install @seasyecn/opencode-child-compaction
+```
+
+Register `@seasyecn/opencode-child-compaction` in the `plugins` array of
+`opencode.json` as above and restart OpenCode after changing registration.
 
 ### Local development (from source)
-
-From the project root, install dependencies and build the plugin:
 
 ```sh
 cd opencode-child-compaction
@@ -185,60 +202,54 @@ bun install
 bun run build
 ```
 
-Register the built entry point in the existing `plugin` array in
-`~/.config/opencode/opencode.json`:
+Register the built entry point:
 
 ```json
 {
-  "plugin": [
+  "plugins": [
     "file:///path/to/opencode-child-compaction/dist/index.js"
   ]
 }
 ```
 
-Merge this entry with any other registered plugins. Restart OpenCode after
-changing the registration.
-
-For this child-only design, keep global compaction disabled. The plugin enables
-native continuation only on its explicit summarize request:
-
-```json
-{
-  "compaction": {
-    "auto": false
-  }
-}
-```
-
-The plugin does not change the global compaction setting. Configure the
-provider/model selected in `config.json` through the normal OpenCode provider
-configuration before using the plugin.
+Restart OpenCode after changing the registration.
 
 ## Development
 
 Run the project checks from the project root:
 
 ```sh
-bun run build
 bun run test
 bun run typecheck
+bun run build
+bun pm pack --dry-run
 ```
+
+The test suite drives the real plugin `setup` with a mock plugin context: it
+consumes the event stream the plugin subscribes to, runs the registered
+`compaction` hook, and asserts scheduling, deduplication, cleanup, and the
+configured summary target — all offline, with no real model calls.
 
 ## Uninstall
 
-1. Remove the plugin entry (`@seasyecn/opencode-child-compaction`, tarball path/URL, or `file:///.../dist/index.js`)
-   from the `plugin` array in `~/.config/opencode/opencode.json`.
+1. Remove the plugin entry (`@seasyecn/opencode-child-compaction`, tarball, or
+   `file:///.../dist/index.js`) from the `plugins` array in
+   `~/.config/opencode/opencode.json`.
 2. Restart OpenCode.
-3. Remove the package, tarball, or repository files separately if they are no longer needed.
+3. Remove the package, tarball, or repository files separately if they are no
+   longer needed.
 
 ## Limitations
 
-- The trigger is a completed assistant-message event. It is not a preflight
-  hard request block, so it does not prevent a request from being sent before
-  compaction is started.
-- Compaction is skipped when the completed message's provider/model metadata
-  is unavailable or its calculated threshold is not reached.
-- The summarize target comes from `config.json`; that model must be
-  configured for native summarization to work.
+- The trigger is a completed assistant-step event. It is not a preflight
+  request block, so it does not prevent a request from being sent before
+  compaction starts.
+- Compaction is skipped when the completed message's model metadata is
+  unavailable, the effective input limit cannot be resolved, or the calculated
+  threshold is not reached.
 - Only child sessions are handled. Root sessions and titles beginning with
   `magic-context-` are excluded.
+- The summary target comes from `config.json`; that provider/model must be
+  configured and available in OpenCode.
+- This release targets OpenCode 2 V2 plugins and pins `@opencode/plugin`
+  `2.0.30`; it does not load under the V1 plugin API of OpenCode 1.x.
