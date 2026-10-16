@@ -1,6 +1,7 @@
 {
   "name": "@seasyecn/opencode-child-compaction",
   "version": "0.2.0",
+  "license": "MIT",
   "description": "OpenCode plugin that compacts eligible child sessions at an adaptive context threshold.",
   "repository": {
     "type": "git",
@@ -15,7 +16,8 @@
   "files": [
     "dist",
     "config.json",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "publishConfig": {
     "access": "public"
